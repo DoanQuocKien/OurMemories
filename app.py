@@ -1,14 +1,30 @@
 import base64
 import os
+import sys
 import traceback
+from pathlib import Path
 import requests
 import webview
 from dotenv import load_dotenv
 
-# Load credentials from .env (never commit .env to git)
-load_dotenv()
+# Resolve the directory that contains (or should contain) .env.
+# When frozen by PyInstaller, sys.executable is the .exe path — look there.
+# When running as a plain script, look next to app.py.
+if getattr(sys, "frozen", False):
+    _BASE = Path(sys.executable).parent   # dist/ folder, next to the .exe
+else:
+    _BASE = Path(__file__).parent         # project folder, next to app.py
+
+_ENV_PATH = _BASE / ".env"
+load_dotenv(dotenv_path=_ENV_PATH)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHAT_ID   = os.getenv("CHAT_ID", "")
+
+if not BOT_TOKEN or not CHAT_ID:
+    print(f"[WARN] .env not found or empty at: {_ENV_PATH}")
+else:
+    print(f"[OK] Credentials loaded from: {_ENV_PATH}")
 
 
 class Api:
