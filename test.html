@@ -1,108 +1,4 @@
-import base64
-import os
-import sys
-import threading
-import traceback
-import concurrent.futures
-import logging
-from pathlib import Path
-import requests
-import webview
-from dotenv import load_dotenv
-
-# Resolve the directory that contains (or should contain) .env.
-# When frozen by PyInstaller, sys.executable is the .exe path — look there.
-# When running as a plain script, look next to app.py.
-if getattr(sys, "frozen", False):
-    _BASE = Path(sys.executable).parent   # dist/ folder, next to the .exe
-else:
-    _BASE = Path(__file__).parent         # project folder, next to app.py
-
-_ENV_PATH = _BASE / ".env"
-load_dotenv(dotenv_path=_ENV_PATH)
-
-logging.basicConfig(filename=str(_BASE / "app.log"), level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
-logging.info("App started")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-CHAT_ID   = os.getenv("CHAT_ID", "")
-
-if not BOT_TOKEN or not CHAT_ID:
-    print(f"[WARN] .env not found or empty at: {_ENV_PATH}")
-else:
-    print(f"[OK] Credentials loaded from: {_ENV_PATH}")
-
-
-class Api:
-    """Python bridge exposed to JavaScript inside the desktop app."""
-
-    def send_opening_ping(self):
-        """Notifies you silently when Tho opens the app."""
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        # Safe ASCII-only text avoids any encoding issues on Windows
-        payload = {"chat_id": CHAT_ID, "text": "She just opened Our Memories! <3"}
-        try:
-            r = requests.post(url, json=payload, timeout=5)
-            logging.info(f"[ping] status: {r.status_code} {r.json().get('ok')}")
-        except Exception as e:
-            logging.error(f"[ping] error: {e}", exc_info=True)
-
-    def get_gallery_photos(self):
-        """Fetches all photos stored in the cloud."""
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        # allowed_updates left out so ALL message types are returned
-        params = {"limit": 100}
-        try:
-            resp = requests.get(url, params=params, timeout=10).json()
-            file_ids = []
-            for result in resp.get("result", []):
-                msg = result.get("message", {})
-                if "photo" in msg:
-                    file_ids.append(msg["photo"][-1]["file_id"])
-                    
-            image_urls = []
-            def fetch_path(fid):
-                try:
-                    finfo = requests.get(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-                        params={"file_id": fid},
-                        timeout=10,
-                    ).json()
-                    path = finfo.get("result", {}).get("file_path")
-                    if path:
-                        return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-                except Exception:
-                    pass
-                return None
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as exe:
-                for res in exe.map(fetch_path, file_ids):
-                    if res:
-                        image_urls.append(res)
-            logging.info(f"[gallery] found {len(image_urls)} photos")
-            return image_urls[::-1]
-        except Exception as e:
-            logging.error(f"[gallery] error: {e}", exc_info=True)
-            return []
-
-    def upload_photo_b64(self, base64_str):
-        """Receives a base64 image from the UI and saves it to the cloud."""
-        try:
-            header, encoded = base64_str.split(",", 1)
-            image_data = base64.b64decode(encoded)
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
-            files = {"photo": ("memory.jpg", image_data, "image/jpeg")}
-            # Caption uses only plain ASCII/unicode — NO surrogate-pair emoji
-            data = {"chat_id": CHAT_ID, "caption": "Thơ shared a new memory! <3"}
-            r = requests.post(url, data=data, files=files, timeout=15)
-            logging.info(f"[upload] status: {r.status_code} {r.json().get('ok')}")
-            return r.json().get("ok", False)
-        except Exception as e:
-            logging.error(f"[upload] error: {e}", exc_info=True)
-            return False
-
-
-HTML_CONTENT = """<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -347,7 +243,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         <path d="M12 21.593c-.525-.445-4.52-3.89-6.71-6.02C3.19 13.49 2 11.7 2 9.5 2 6.462 4.462 4 7.5 4c1.74 0 3.41.81 4.5 2.088C13.09 4.81 14.76 4 16.5 4 19.538 4 22 6.462 22 9.5c0 2.2-1.19 3.99-3.29 6.073-2.19 2.13-6.185 5.575-6.71 6.02z"/>
       </svg>
     </div>
-    <h1>Th\u01a1 &amp; Em &#x1f495;</h1>
+    <h1>Thơ &amp; Em &#x1f495;</h1>
     <p class="tagline">Every moment with you is a treasure</p>
     <div class="petals">
       <span class="petal">&#x1f338;</span>
@@ -456,8 +352,8 @@ HTML_CONTENT = """<!DOCTYPE html>
         return;
       }
       g.innerHTML = urls.map(function(url){
-        return '<div class="thumb" onclick="openLightbox(\\'' + url + '\\')">'
-             + '<img src="' + url + '" class="loading" onload="this.classList.remove(\\'loading\\')" alt="Memory">'
+        return '<div class="thumb" onclick="openLightbox(\'' + url + '\')">'
+             + '<img src="' + url + '" class="loading" onload="this.classList.remove(\'loading\')" alt="Memory">'
              + '</div>';
       }).join('');
     }).catch(function(){
@@ -499,10 +395,10 @@ HTML_CONTENT = """<!DOCTYPE html>
           bar.style.width = '100%';
           setTimeout(function(){ bar.style.display='none'; bar.style.width='0%'; }, 700);
           if(ok){
-            showToast('&#x2764;&#xfe0f;', "Memory saved &#x2014; she'll love it!");
+            showToast('&#x2764;&#xfe0f;', 'Memory saved &#x2014; she'll love it!');
             setTimeout(loadGallery, 1400);
           } else {
-            showToast('&#x26a0;&#xfe0f;', "Couldn't save &#x2014; please try again.");
+            showToast('&#x26a0;&#xfe0f;', 'Couldn't save &#x2014; please try again.');
           }
           document.getElementById('fileInput').value = '';
         });
@@ -517,24 +413,4 @@ HTML_CONTENT = """<!DOCTYPE html>
   });
 </script>
 </body>
-</html>"""
-
-
-if __name__ == "__main__":
-    api = Api()
-
-    # Fire the opening ping immediately in a background thread —
-    # does NOT depend on JavaScript or the webview finishing load.
-    ping_thread = threading.Thread(target=api.send_opening_ping, daemon=True)
-    ping_thread.start()
-
-    webview.create_window(
-        title="Tho & Em",
-        html=HTML_CONTENT,
-        width=520,
-        height=690,
-        resizable=True,
-        js_api=api,
-        background_color="#0c080a",
-    )
-    webview.start(debug=True)
+</html>
