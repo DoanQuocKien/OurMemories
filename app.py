@@ -1,5 +1,6 @@
 import base64
 import os
+import traceback
 import requests
 import webview
 from dotenv import load_dotenv
@@ -16,16 +17,19 @@ class Api:
     def send_opening_ping(self):
         """Notifies you silently when Tho opens the app."""
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": "\u2764\ufe0f Tho vua mo app cua chung minh!"}
+        # Safe ASCII-only text avoids any encoding issues on Windows
+        payload = {"chat_id": CHAT_ID, "text": "She just opened Our Memories! <3"}
         try:
-            requests.post(url, json=payload, timeout=5)
+            r = requests.post(url, json=payload, timeout=5)
+            print("[ping] status:", r.status_code, r.json().get("ok"))
         except Exception:
-            pass
+            traceback.print_exc()
 
     def get_gallery_photos(self):
         """Fetches all photos stored in the cloud."""
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        params = {"limit": 100, "allowed_updates": ["message"]}
+        # allowed_updates left out so ALL message types are returned
+        params = {"limit": 100}
         try:
             resp = requests.get(url, params=params, timeout=10).json()
             image_urls = []
@@ -43,8 +47,10 @@ class Api:
                         image_urls.append(
                             f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
                         )
+            print(f"[gallery] found {len(image_urls)} photos")
             return image_urls[::-1]
         except Exception:
+            traceback.print_exc()
             return []
 
     def upload_photo_b64(self, base64_str):
@@ -54,10 +60,13 @@ class Api:
             image_data = base64.b64decode(encoded)
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
             files = {"photo": ("memory.jpg", image_data, "image/jpeg")}
-            data = {"chat_id": CHAT_ID, "caption": "\ud83d\udcf8 Tho da chia se mot ky niem moi voi ban! \u2764\ufe0f"}
-            requests.post(url, data=data, files=files, timeout=15)
-            return True
+            # Caption uses only plain ASCII/unicode — NO surrogate-pair emoji
+            data = {"chat_id": CHAT_ID, "caption": "Tho shared a new memory! <3"}
+            r = requests.post(url, data=data, files=files, timeout=15)
+            print("[upload] status:", r.status_code, r.json().get("ok"))
+            return r.json().get("ok", False)
         except Exception:
+            traceback.print_exc()
             return False
 
 
