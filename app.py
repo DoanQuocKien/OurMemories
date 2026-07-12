@@ -18,14 +18,17 @@ from dotenv import load_dotenv
 # When frozen by PyInstaller, sys.executable is the .exe path — look there.
 # When running as a plain script, look next to app.py.
 if getattr(sys, "frozen", False):
-    _BASE = Path(sys.executable).parent   # dist/ folder, next to the .exe
+    bundle_dir = Path(sys._MEIPASS)   # Extracted bundle folder
 else:
-    _BASE = Path(__file__).parent         # project folder, next to app.py
+    bundle_dir = Path(__file__).parent
 
-_ENV_PATH = _BASE / ".env"
+_ENV_PATH = bundle_dir / ".env"
 load_dotenv(dotenv_path=_ENV_PATH)
 
-logging.basicConfig(filename=str(_BASE / "app.log"), level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
+_VAULT = Path(os.path.expanduser("~/Documents/OurMemories_Vault"))
+_VAULT.mkdir(parents=True, exist_ok=True)
+
+logging.basicConfig(filename=str(_VAULT / "app.log"), level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logging.info("App started")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -35,9 +38,6 @@ if not BOT_TOKEN or not CHAT_ID:
     print(f"[WARN] .env not found or empty at: {_ENV_PATH}")
 else:
     print(f"[OK] Credentials loaded from: {_ENV_PATH}")
-
-_VAULT = Path(os.path.expanduser("~/Documents/OurMemories_Vault"))
-_VAULT.mkdir(parents=True, exist_ok=True)
 
 app_bottle = Bottle()
 @app_bottle.route('/vault/<filename:path>')
@@ -727,4 +727,4 @@ if __name__ == "__main__":
         js_api=api,
         background_color="#0c080a",
     )
-    webview.start(debug=True)
+    webview.start()
