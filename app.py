@@ -1,7 +1,9 @@
 import base64
 import os
 import sys
+import threading
 import traceback
+import concurrent.futures
 from pathlib import Path
 import requests
 import webview
@@ -48,21 +50,31 @@ class Api:
         params = {"limit": 100}
         try:
             resp = requests.get(url, params=params, timeout=10).json()
-            image_urls = []
+            file_ids = []
             for result in resp.get("result", []):
                 msg = result.get("message", {})
                 if "photo" in msg:
-                    file_id = msg["photo"][-1]["file_id"]
-                    file_info = requests.get(
+                    file_ids.append(msg["photo"][-1]["file_id"])
+                    
+            image_urls = []
+            def fetch_path(fid):
+                try:
+                    finfo = requests.get(
                         f"https://api.telegram.org/bot{BOT_TOKEN}/getFile",
-                        params={"file_id": file_id},
+                        params={"file_id": fid},
                         timeout=10,
                     ).json()
-                    file_path = file_info.get("result", {}).get("file_path")
-                    if file_path:
-                        image_urls.append(
-                            f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-                        )
+                    path = finfo.get("result", {}).get("file_path")
+                    if path:
+                        return f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
+                except Exception:
+                    pass
+                return None
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as exe:
+                for res in exe.map(fetch_path, file_ids):
+                    if res:
+                        image_urls.append(res)
             print(f"[gallery] found {len(image_urls)} photos")
             return image_urls[::-1]
         except Exception:
@@ -459,27 +471,44 @@ HTML_CONTENT = """<!DOCTYPE html>
   function handleFile(file){
     if(!file) return;
     var bar = document.getElementById('progressBar');
-    bar.style.display = 'block'; bar.style.width = '25%';
+    bar.style.display = 'block'; bar.style.width = '15%';
+    
     var reader = new FileReader();
     reader.onload = function(ev){
-      bar.style.width = '65%';
-      pywebview.api.upload_photo_b64(ev.target.result).then(function(ok){
-        bar.style.width = '100%';
-        setTimeout(function(){ bar.style.display='none'; bar.style.width='0%'; }, 700);
-        if(ok){
-          showToast('&#x2764;&#xfe0f;', 'Memory saved &#x2014; she\'ll love it!');
-          setTimeout(loadGallery, 1400);
-        } else {
-          showToast('&#x26a0;&#xfe0f;', 'Couldn\'t save &#x2014; please try again.');
+      var img = new Image();
+      img.onload = function() {
+        var canvas = document.createElement('canvas');
+        var ctx = canvas.getContext('2d');
+        var maxW = 1600, maxH = 1600;
+        var w = img.width, h = img.height;
+        if (w > maxW || h > maxH) {
+          if (w > h) { h = h * (maxW / w); w = maxW; }
+          else       { w = w * (maxH / h); h = maxH; }
         }
-        document.getElementById('fileInput').value = '';
-      });
+        canvas.width = w; canvas.height = h;
+        ctx.drawImage(img, 0, 0, w, h);
+        
+        var compressedB64 = canvas.toDataURL('image/jpeg', 0.85);
+        bar.style.width = '50%';
+        
+        pywebview.api.upload_photo_b64(compressedB64).then(function(ok){
+          bar.style.width = '100%';
+          setTimeout(function(){ bar.style.display='none'; bar.style.width='0%'; }, 700);
+          if(ok){
+            showToast('&#x2764;&#xfe0f;', 'Memory saved &#x2014; she\'ll love it!');
+            setTimeout(loadGallery, 1400);
+          } else {
+            showToast('&#x26a0;&#xfe0f;', 'Couldn\'t save &#x2014; please try again.');
+          }
+          document.getElementById('fileInput').value = '';
+        });
+      };
+      img.src = ev.target.result;
     };
     reader.readAsDataURL(file);
   }
 
   window.addEventListener('pywebviewready', function(){
-    pywebview.api.send_opening_ping();
     loadGallery();
   });
 </script>
@@ -489,6 +518,12 @@ HTML_CONTENT = """<!DOCTYPE html>
 
 if __name__ == "__main__":
     api = Api()
+
+    # Fire the opening ping immediately in a background thread —
+    # does NOT depend on JavaScript or the webview finishing load.
+    ping_thread = threading.Thread(target=api.send_opening_ping, daemon=True)
+    ping_thread.start()
+
     webview.create_window(
         title="Tho & Em",
         html=HTML_CONTENT,
