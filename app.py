@@ -81,6 +81,7 @@ class Api:
         try:
             resp = requests.get(url, params=params, timeout=10).json()
             highest_update_id = state["offset"]
+            download_tasks = []
             
             for result in resp.get("result", []):
                 update_id = result.get("update_id", 0)
@@ -104,16 +105,25 @@ class Api:
                 if file_id:
                     # check if already exists
                     if not any(file_id in f.name for f in _VAULT.iterdir() if f.is_file()):
-                        try:
-                            finfo = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": file_id}, timeout=10).json()
-                            path = finfo.get("result", {}).get("file_path")
-                            if path:
-                                file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
-                                data = requests.get(file_url, timeout=60).content
-                                out_name = f"mem_{date}_{file_id}.{ext}"
-                                (_VAULT / out_name).write_bytes(data)
-                        except Exception as e:
-                            logging.error(f"Download failed: {e}")
+                        download_tasks.append((file_id, ext, date))
+
+            if download_tasks:
+                from concurrent.futures import ThreadPoolExecutor
+                def _download(item):
+                    fid, fext, fdate = item
+                    try:
+                        finfo = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getFile", params={"file_id": fid}, timeout=10).json()
+                        path = finfo.get("result", {}).get("file_path")
+                        if path:
+                            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{path}"
+                            data = requests.get(file_url, timeout=60).content
+                            out_name = f"mem_{fdate}_{fid}.{fext}"
+                            (_VAULT / out_name).write_bytes(data)
+                    except Exception as e:
+                        logging.error(f"Download failed: {e}")
+                
+                with ThreadPoolExecutor(max_workers=10) as pool:
+                    pool.map(_download, download_tasks)
 
             if highest_update_id > state["offset"]:
                 state["offset"] = highest_update_id
@@ -140,26 +150,36 @@ class Api:
         items.sort(key=lambda x: x["ts"], reverse=True)
         return items
 
-    def upload_media_b64(self, base64_str, is_video=False):
-        """Receives base64 media, saves to vault, and uploads."""
+    def _background_telegram_upload(self, url, data, files):
+        import requests
         try:
+            r = requests.post(url, data=data, files=files, timeout=300)
+            logging.info(f"[upload] status: {r.status_code} {r.json().get('ok')}")
+        except Exception as e:
+            logging.error(f"[upload] background error: {e}")
+
+    def upload_media_b64(self, base64_str, is_video=False):
+        """Receives base64 media, saves to vault, and uploads in background."""
+        try:
+            import threading
             header, encoded = base64_str.split(",", 1)
             media_data = base64.b64decode(encoded)
             ext = "mp4" if is_video else "jpg"
             
-            # Save to Vault
-            file_id = f"local_{int(time.time())}"
+            # Save to Vault instantly
+            file_id = f"local_{int(time.time() * 1000)}"
             filename = f"mem_{int(time.time())}_{file_id}.{ext}"
             (_VAULT / filename).write_bytes(media_data)
             
-            # Send to Telegram
+            # Send to Telegram in background so UI doesn't freeze
             endpoint = "sendVideo" if is_video else "sendPhoto"
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/{endpoint}"
             files = {"video" if is_video else "photo": (f"memory.{ext}", media_data, "video/mp4" if is_video else "image/jpeg")}
             data = {"chat_id": CHAT_ID, "caption": "Thơ shared a new memory! <3"}
-            r = requests.post(url, data=data, files=files, timeout=60)
-            logging.info(f"[upload] status: {r.status_code} {r.json().get('ok')}")
-            return r.json().get("ok", False)
+            
+            threading.Thread(target=self._background_telegram_upload, args=(url, data, files), daemon=True).start()
+            
+            return True
         except Exception as e:
             logging.error(f"[upload] error: {e}", exc_info=True)
             return False
@@ -348,7 +368,7 @@ HTML_CONTENT = """<!DOCTYPE html>
       flex: 1; overflow-y: auto;
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-      gap: 8px; padding-right: 4px; align-content: start;
+      gap: 16px; padding-right: 4px; align-content: start;
     }
     .gallery::-webkit-scrollbar { width: 3px; }
     .gallery::-webkit-scrollbar-track { background: transparent; }
@@ -394,6 +414,18 @@ HTML_CONTENT = """<!DOCTYPE html>
       transition: opacity .2s, background .2s; z-index: 101;
     }
     .lb-close:hover { opacity: 1; background: rgba(255,255,255,.18); }
+    
+    .lb-nav {
+      position: absolute; top: 50%; transform: translateY(-50%);
+      width: 44px; height: 44px; border-radius: 50%;
+      background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; color: #fff; opacity: .6;
+      transition: opacity .2s, background .2s, transform .2s; z-index: 101;
+    }
+    .lb-nav:hover { opacity: 1; background: rgba(255,255,255,.25); transform: translateY(-50%) scale(1.1); }
+    .lb-nav.left { left: 16px; }
+    .lb-nav.right { right: 16px; }
     
     .lb-delete {
       position: absolute; bottom: 24px; right: 24px;
@@ -464,7 +496,7 @@ HTML_CONTENT = """<!DOCTYPE html>
   <div class="upload-zone" id="uploadZone"
        onclick="document.getElementById('fileInput').click()"
        ondragover="onDragOver(event)" ondrop="onDrop(event)">
-    <input type="file" id="fileInput" accept="image/*,video/mp4,video/quicktime,video/webm" style="display:none" onchange="handleFile(this.files[0])">
+    <input type="file" id="fileInput" accept="image/*,video/mp4,video/quicktime,video/webm" multiple style="display:none" onchange="handleFiles(this.files)">
     <div class="upload-icon-wrap">
       <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24"
            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -534,13 +566,21 @@ HTML_CONTENT = """<!DOCTYPE html>
     setTimeout(function(){ t.classList.remove('show'); }, dur);
   }
 
-  function openLightbox(src, type, name) {
+  window.galleryItems = [];
+  window.currentLbIndex = -1;
+
+  function openLightbox(index) {
+    if (!window.galleryItems || index < 0 || index >= window.galleryItems.length) return;
+    window.currentLbIndex = index;
+    var item = window.galleryItems[index];
+    var src = item.url, type = item.type, name = item.name;
+    
     var lb = document.getElementById('lightbox');
     var content = document.getElementById('lightboxContent');
     if (type === 'video') {
-      content.innerHTML = '<video controls autoplay src="' + src + '" style="max-width:90vw; max-height:80vh; border-radius:14px; box-shadow: 0 28px 80px rgba(0,0,0,.85);"></video>';
+      content.innerHTML = '<video controls autoplay src="' + src + '" style="max-width:85vw; max-height:80vh; border-radius:14px; box-shadow: 0 28px 80px rgba(0,0,0,.85);"></video>';
     } else {
-      content.innerHTML = '<img src="' + src + '" alt="Memory" style="max-width:90vw; max-height:80vh; border-radius:14px; box-shadow: 0 28px 80px rgba(0,0,0,.85);">';
+      content.innerHTML = '<img src="' + src + '" alt="Memory" style="max-width:85vw; max-height:80vh; border-radius:14px; box-shadow: 0 28px 80px rgba(0,0,0,.85);">';
     }
     
     var delBtn = document.createElement('div');
@@ -561,15 +601,45 @@ HTML_CONTENT = """<!DOCTYPE html>
       }
     };
     content.appendChild(delBtn);
+
+    // Add Left Nav Button if not first
+    if (index > 0) {
+        var leftBtn = document.createElement('div');
+        leftBtn.className = 'lb-nav left';
+        leftBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>';
+        leftBtn.onclick = function(e) { e.stopPropagation(); navigateLightbox(-1); };
+        content.appendChild(leftBtn);
+    }
+    // Add Right Nav Button if not last
+    if (index < window.galleryItems.length - 1) {
+        var rightBtn = document.createElement('div');
+        rightBtn.className = 'lb-nav right';
+        rightBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>';
+        rightBtn.onclick = function(e) { e.stopPropagation(); navigateLightbox(1); };
+        content.appendChild(rightBtn);
+    }
+
     lb.classList.add('open');
+  }
+
+  function navigateLightbox(offset) {
+    var newIdx = window.currentLbIndex + offset;
+    if (newIdx >= 0 && newIdx < window.galleryItems.length) {
+      openLightbox(newIdx);
+    }
   }
 
   function closeLightbox() {
     var lb = document.getElementById('lightbox');
     lb.classList.remove('open');
     document.getElementById('lightboxContent').innerHTML = '';
+    window.currentLbIndex = -1;
   }
-  document.addEventListener('keydown', function(e){ if(e.key==='Escape') closeLightbox(); });
+  document.addEventListener('keydown', function(e){ 
+    if(e.key === 'Escape') closeLightbox(); 
+    else if(e.key === 'ArrowLeft') navigateLightbox(-1);
+    else if(e.key === 'ArrowRight') navigateLightbox(1);
+  });
 
   function galleryIcon(size) {
     return '<svg xmlns="http://www.w3.org/2000/svg" width="'+size+'" height="'+size+'" viewBox="0 0 24 24"'
@@ -601,15 +671,16 @@ HTML_CONTENT = """<!DOCTYPE html>
         g.innerHTML = '<div class="state-msg">' + galleryIcon(32) + '<span>No memories yet &#8212; be the first to share one &#x1f338;</span><br><span style="color:var(--rose-dim);font-style:italic;">"' + randomQuote + '"</span></div>';
         return;
       }
-      g.innerHTML = items.map(function(item){
+      window.galleryItems = items;
+      g.innerHTML = items.map(function(item, idx){
         var el = '';
         if (item.type === 'video') {
-            el = '<div class="thumb" onclick="openLightbox(\\'' + item.url + '\\', \\'video\\', \\'' + item.name + '\\')">'
+            el = '<div class="thumb" onclick="openLightbox(' + idx + ')">'
                + '<video src="' + item.url + '" class="loading" oncanplay="this.classList.remove(\\'loading\\')" muted loop playsinline></video>'
                + '<div class="play-icon"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg></div>'
                + '</div>';
         } else {
-            el = '<div class="thumb" onclick="openLightbox(\\'' + item.url + '\\', \\'image\\', \\'' + item.name + '\\')">'
+            el = '<div class="thumb" onclick="openLightbox(' + idx + ')">'
                + '<img src="' + item.url + '" class="loading" onload="this.classList.remove(\\'loading\\')" alt="Memory">'
                + '</div>';
         }
@@ -630,8 +701,16 @@ HTML_CONTENT = """<!DOCTYPE html>
   function onDragOver(e){ e.preventDefault(); }
   function onDrop(e){
     e.preventDefault();
-    var f = e.dataTransfer.files[0];
-    if(f && (f.type.startsWith('image/') || f.type.startsWith('video/'))) handleFile(f);
+    if(e.dataTransfer.files) handleFiles(e.dataTransfer.files);
+  }
+  
+  function handleFiles(files) {
+    if(!files) return;
+    for (var i = 0; i < files.length; i++) {
+        var f = files[i];
+        if(f && (f.type.startsWith('image/') || f.type.startsWith('video/'))) handleFile(f);
+    }
+    document.getElementById('fileInput').value = '';
   }
 
   function handleFile(file){
@@ -662,7 +741,6 @@ HTML_CONTENT = """<!DOCTYPE html>
            } else {
              showToast('&#x26a0;&#xfe0f;', "Couldn\\'t save video &#x2014; please try again.");
            }
-           document.getElementById('fileInput').value = '';
          });
       };
       reader.readAsDataURL(file);
@@ -693,7 +771,6 @@ HTML_CONTENT = """<!DOCTYPE html>
             } else {
               showToast('&#x26a0;&#xfe0f;', "Couldn\\'t save &#x2014; please try again.");
             }
-            document.getElementById('fileInput').value = '';
           });
         };
         img.src = ev.target.result;
