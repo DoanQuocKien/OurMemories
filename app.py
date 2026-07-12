@@ -368,7 +368,9 @@ HTML_CONTENT = """<!DOCTYPE html>
       flex: 1; overflow-y: auto;
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
-      gap: 16px; padding-right: 4px; align-content: start;
+      row-gap: 28px;
+      column-gap: 16px;
+      padding-right: 4px; align-content: start;
     }
     .gallery::-webkit-scrollbar { width: 3px; }
     .gallery::-webkit-scrollbar-track { background: transparent; }
