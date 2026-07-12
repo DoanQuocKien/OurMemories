@@ -123,7 +123,7 @@ class Api:
 
         items = []
         for f in _VAULT.iterdir():
-            if f.is_file() and not f.name.endswith(".json"):
+            if f.is_file() and f.suffix.lower() in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".webm", ".avi"]:
                 try:
                     ts = int(f.name.split('_')[1])
                 except Exception:
