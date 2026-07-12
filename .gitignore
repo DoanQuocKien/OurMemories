@@ -1,0 +1,9 @@
+﻿# Secret — never commit this
+.env
+
+# PyInstaller build artifacts
+dist/
+build/
+*.spec
+__pycache__/
+*.pyc

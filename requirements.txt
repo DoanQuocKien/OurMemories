@@ -1,0 +1,4 @@
+pywebview>=4.4
+requests>=2.31
+python-dotenv>=1.0
+pyinstaller>=6.0
