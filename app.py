@@ -53,6 +53,28 @@ LOCAL_PORT = get_free_port()
 threading.Thread(target=lambda: app_bottle.run(host='127.0.0.1', port=LOCAL_PORT, quiet=True), daemon=True).start()
 
 
+def _load_metadata():
+    meta_file = _VAULT / "metadata.json"
+    if meta_file.exists():
+        try:
+            return json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception: pass
+    return {}
+
+def _save_metadata(meta):
+    meta_file = _VAULT / "metadata.json"
+    try:
+        meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logging.error(f"Failed to save metadata: {e}")
+
+def _find_filename_by_file_id(file_id):
+    for f in _VAULT.iterdir():
+        if f.is_file() and file_id in f.name:
+            return f.name
+    return None
+
+
 class Api:
     """Python bridge exposed to JavaScript inside the desktop app."""
 
@@ -82,6 +104,7 @@ class Api:
             resp = requests.get(url, params=params, timeout=10).json()
             highest_update_id = state["offset"]
             download_tasks = []
+            update_metadata_actions = []
             
             for result in resp.get("result", []):
                 update_id = result.get("update_id", 0)
@@ -93,6 +116,8 @@ class Api:
                 
                 file_id = None
                 ext = "jpg"
+                caption = msg.get("caption", "").strip()
+                
                 if "photo" in msg:
                     file_id = msg["photo"][-1]["file_id"]
                 elif "video" in msg:
@@ -106,6 +131,30 @@ class Api:
                     # check if already exists
                     if not any(file_id in f.name for f in _VAULT.iterdir() if f.is_file()):
                         download_tasks.append((file_id, ext, date))
+                    if caption:
+                        update_metadata_actions.append(("caption", file_id, caption))
+                    msg_id = msg.get("message_id")
+                    if msg_id:
+                        update_metadata_actions.append(("message_id", file_id, msg_id))
+                
+                # Check for replies (comments)
+                reply_to = msg.get("reply_to_message", {})
+                reply_text = msg.get("text", "").strip()
+                if reply_to and reply_text:
+                    parent_fid = None
+                    if "photo" in reply_to:
+                        parent_fid = reply_to["photo"][-1]["file_id"]
+                    elif "video" in reply_to:
+                        parent_fid = reply_to["video"]["file_id"]
+                    elif "document" in reply_to:
+                        parent_fid = reply_to["document"]["file_id"]
+                    
+                    if parent_fid:
+                        author_id = msg.get("from", {}).get("id")
+                        author_name = msg.get("from", {}).get("first_name", "Kiên")
+                        if str(author_id) == str(CHAT_ID):
+                            author_name = "Kiên"
+                        update_metadata_actions.append(("comment", parent_fid, author_name, reply_text, date))
 
             if download_tasks:
                 from concurrent.futures import ThreadPoolExecutor
@@ -125,12 +174,55 @@ class Api:
                 with ThreadPoolExecutor(max_workers=10) as pool:
                     pool.map(_download, download_tasks)
 
+            # Apply metadata updates (caption/comments) from Telegram
+            meta = _load_metadata()
+            meta_changed = False
+            for action in update_metadata_actions:
+                if action[0] == "caption":
+                    _, fid, caption_text = action
+                    fname = _find_filename_by_file_id(fid)
+                    if fname:
+                        if fname not in meta:
+                            meta[fname] = {}
+                        if not meta[fname].get("caption"):
+                            meta[fname]["caption"] = caption_text
+                            meta_changed = True
+                elif action[0] == "message_id":
+                    _, fid, msg_id = action
+                    fname = _find_filename_by_file_id(fid)
+                    if fname:
+                        if fname not in meta:
+                            meta[fname] = {}
+                        if meta[fname].get("message_id") != msg_id:
+                            meta[fname]["message_id"] = msg_id
+                            meta_changed = True
+                elif action[0] == "comment":
+                    _, parent_fid, author_name, comment_text, comment_date = action
+                    fname = _find_filename_by_file_id(parent_fid)
+                    if fname:
+                        if fname not in meta:
+                            meta[fname] = {}
+                        if "comments" not in meta[fname]:
+                            meta[fname]["comments"] = []
+                        comments_list = meta[fname]["comments"]
+                        dup = any(c.get("author") == author_name and c.get("text") == comment_text and c.get("ts") == comment_date for c in comments_list)
+                        if not dup:
+                            comments_list.append({
+                                "author": author_name,
+                                "text": comment_text,
+                                "ts": comment_date
+                            })
+                            meta_changed = True
+            if meta_changed:
+                _save_metadata(meta)
+
             if highest_update_id > state["offset"]:
                 state["offset"] = highest_update_id
                 state_file.write_text(json.dumps(state), encoding="utf-8")
         except Exception as e:
             logging.error(f"[sync] error: {e}", exc_info=True)
 
+        meta = _load_metadata()
         items = []
         for f in _VAULT.iterdir():
             if f.is_file() and f.suffix.lower() in [".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".mov", ".webm", ".avi"]:
@@ -140,21 +232,35 @@ class Api:
                     ts = f.stat().st_mtime
                     
                 ftype = "video" if f.suffix.lower() in [".mp4", ".mov", ".webm", ".avi"] else "image"
+                fmeta = meta.get(f.name, {})
                 items.append({
                     "url": f"http://127.0.0.1:{LOCAL_PORT}/vault/{f.name}",
                     "name": f.name,
                     "type": ftype,
-                    "ts": ts
+                    "ts": ts,
+                    "caption": fmeta.get("caption", ""),
+                    "comments": fmeta.get("comments", [])
                 })
         
         items.sort(key=lambda x: x["ts"], reverse=True)
         return items
 
-    def _background_telegram_upload(self, url, data, files):
-        import requests
+    def _background_telegram_upload(self, url, data, files, local_filename=None):
         try:
             r = requests.post(url, data=data, files=files, timeout=300)
-            logging.info(f"[upload] status: {r.status_code} {r.json().get('ok')}")
+            resp = r.json()
+            logging.info(f"[upload] status: {r.status_code} {resp.get('ok')}")
+            # Save Telegram message_id so captions/replies can reference back
+            if local_filename and resp.get("ok"):
+                result = resp.get("result", {})
+                msg_id = result.get("message_id")
+                if msg_id:
+                    meta = _load_metadata()
+                    if local_filename not in meta:
+                        meta[local_filename] = {}
+                    meta[local_filename]["message_id"] = msg_id
+                    _save_metadata(meta)
+                    logging.info(f"[upload] saved message_id={msg_id} for {local_filename}")
         except Exception as e:
             logging.error(f"[upload] background error: {e}")
 
@@ -177,7 +283,7 @@ class Api:
             files = {"video" if is_video else "photo": (f"memory.{ext}", media_data, "video/mp4" if is_video else "image/jpeg")}
             data = {"chat_id": CHAT_ID, "caption": "Thơ shared a new memory! <3"}
             
-            threading.Thread(target=self._background_telegram_upload, args=(url, data, files), daemon=True).start()
+            threading.Thread(target=self._background_telegram_upload, args=(url, data, files, filename), daemon=True).start()
             
             return True
         except Exception as e:
@@ -189,10 +295,113 @@ class Api:
             f = _VAULT / filename
             if f.exists():
                 f.unlink()
+            meta = _load_metadata()
+            if filename in meta:
+                meta.pop(filename)
+                _save_metadata(meta)
             return True
         except Exception as e:
             logging.error(f"[delete] error: {e}", exc_info=True)
             return False
+
+    def save_caption(self, filename, caption_text):
+        """Saves caption locally and edits it on Telegram so you see it too."""
+        try:
+            meta = _load_metadata()
+            if filename not in meta:
+                meta[filename] = {}
+            meta[filename]["caption"] = caption_text
+            _save_metadata(meta)
+            
+            # Push to Telegram: edit the caption of the original message
+            msg_id = meta[filename].get("message_id")
+            if msg_id:
+                def _push_caption():
+                    try:
+                        requests.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageCaption",
+                            json={"chat_id": CHAT_ID, "message_id": msg_id, "caption": caption_text},
+                            timeout=10
+                        )
+                    except Exception as e:
+                        logging.error(f"editMessageCaption error: {e}")
+                threading.Thread(target=_push_caption, daemon=True).start()
+            
+            return True
+        except Exception as e:
+            logging.error(f"save_caption error: {e}")
+            return False
+
+    def add_comment(self, filename, text, author="Thơ"):
+        """Adds a comment locally and sends it as a Telegram reply to the original image."""
+        try:
+            meta = _load_metadata()
+            if filename not in meta:
+                meta[filename] = {}
+            if "comments" not in meta[filename]:
+                meta[filename]["comments"] = []
+            
+            meta[filename]["comments"].append({
+                "author": author,
+                "text": text,
+                "ts": int(time.time())
+            })
+            _save_metadata(meta)
+            
+            # Push to Telegram: reply to the original image message
+            msg_id = meta[filename].get("message_id")
+            def _push_reply():
+                try:
+                    payload = {
+                        "chat_id": CHAT_ID,
+                        "text": f"\U0001f338 {author}: {text}",
+                    }
+                    if msg_id:
+                        payload["reply_to_message_id"] = msg_id
+                    requests.post(
+                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                        json=payload,
+                        timeout=10
+                    )
+                except Exception as e:
+                    logging.error(f"add_comment telegram error: {e}")
+            threading.Thread(target=_push_reply, daemon=True).start()
+            
+            return True
+        except Exception as e:
+            logging.error(f"add_comment error: {e}")
+            return False
+
+    def edit_comment(self, filename, comment_idx, new_text):
+        """Edits an existing comment by index."""
+        try:
+            meta = _load_metadata()
+            if filename in meta and "comments" in meta[filename]:
+                comments = meta[filename]["comments"]
+                if 0 <= comment_idx < len(comments):
+                    comments[comment_idx]["text"] = new_text
+                    _save_metadata(meta)
+                    return True
+            return False
+        except Exception as e:
+            logging.error(f"edit_comment error: {e}")
+            return False
+
+    def delete_comment(self, filename, comment_idx):
+        """Deletes an existing comment by index."""
+        try:
+            meta = _load_metadata()
+            if filename in meta and "comments" in meta[filename]:
+                comments = meta[filename]["comments"]
+                if 0 <= comment_idx < len(comments):
+                    comments.pop(comment_idx)
+                    _save_metadata(meta)
+                    return True
+            return False
+        except Exception as e:
+            logging.error(f"delete_comment error: {e}")
+            return False
+
 
 
 HTML_CONTENT = """<!DOCTYPE html>
@@ -413,19 +622,19 @@ HTML_CONTENT = """<!DOCTYPE html>
       background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14);
       display: flex; align-items: center; justify-content: center;
       cursor: pointer; color: #fff; opacity: .75;
-      transition: opacity .2s, background .2s; z-index: 101;
+      transition: opacity .2s, background .2s; z-index: 105;
     }
     .lb-close:hover { opacity: 1; background: rgba(255,255,255,.18); }
     
     .lb-nav {
       position: absolute; top: 50%; transform: translateY(-50%);
       width: 44px; height: 44px; border-radius: 50%;
-      background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.14);
+      background: rgba(0,0,0,.4); border: 1px solid rgba(255,255,255,.14);
       display: flex; align-items: center; justify-content: center;
-      cursor: pointer; color: #fff; opacity: .6;
+      cursor: pointer; color: #fff; opacity: .7;
       transition: opacity .2s, background .2s, transform .2s; z-index: 101;
     }
-    .lb-nav:hover { opacity: 1; background: rgba(255,255,255,.25); transform: translateY(-50%) scale(1.1); }
+    .lb-nav:hover { opacity: 1; background: rgba(0,0,0,.6); transform: translateY(-50%) scale(1.1); }
     .lb-nav.left { left: 16px; }
     .lb-nav.right { right: 16px; }
     
@@ -438,6 +647,271 @@ HTML_CONTENT = """<!DOCTYPE html>
       transition: opacity .2s, background .2s, transform .2s; z-index: 101;
     }
     .lb-delete:hover { opacity: 1; background: rgba(232,88,122,.35); transform: scale(1.1); }
+    
+    /* Split Lightbox Wrapper */
+    .lb-wrapper {
+      display: flex;
+      flex-direction: row;
+      width: 90vw;
+      height: 85vh;
+      max-width: 1100px;
+      background: var(--bg);
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      box-shadow: 0 24px 70px rgba(0,0,0,.6);
+      position: relative;
+      animation: fadeIn .22s ease;
+    }
+    .lb-media-pane {
+      flex: 1;
+      background: #0b0709;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      min-width: 0;
+    }
+    .lb-media-pane img,
+    .lb-media-pane video {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+      display: block;
+      box-shadow: 0 10px 30px rgba(0,0,0,.5);
+    }
+    .lb-info-pane {
+      width: 340px;
+      display: flex;
+      flex-direction: column;
+      background: var(--card);
+      border-left: 1px solid var(--border);
+      flex-shrink: 0;
+      box-sizing: border-box;
+    }
+    
+    /* Caption Section */
+    .lb-caption-section {
+      padding: 16px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,.01);
+    }
+    .lb-caption-title {
+      font-size: .73rem;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      color: var(--rose-dim);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-weight: 600;
+    }
+    .lb-caption-text {
+      font-size: .88rem;
+      color: var(--text);
+      line-height: 1.4;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-style: italic;
+    }
+    .lb-caption-empty {
+      font-size: .83rem;
+      color: var(--muted);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: color .2s;
+    }
+    .lb-caption-empty:hover {
+      color: var(--rose);
+    }
+    .lb-caption-edit-box {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    .lb-caption-input {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: inherit;
+      font-size: .83rem;
+      padding: 8px;
+      border-radius: 8px;
+      resize: vertical;
+      min-height: 60px;
+      box-sizing: border-box;
+    }
+    .lb-caption-input:focus {
+      outline: none;
+      border-color: var(--rose);
+    }
+    .lb-action-buttons {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .lb-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: .75rem;
+      padding: 4px 10px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-family: inherit;
+      transition: background .2s, border-color .2s;
+    }
+    .lb-btn.primary {
+      background: var(--rose);
+      border-color: var(--rose);
+      color: white;
+    }
+    .lb-btn.primary:hover {
+      background: #df4468;
+    }
+    .lb-btn:hover:not(.primary) {
+      background: rgba(255,255,255,.05);
+      border-color: var(--rose-dim);
+    }
+
+    /* Comments Section */
+    .lb-comments-section {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .lb-comments-section::-webkit-scrollbar { width: 3px; }
+    .lb-comments-section::-webkit-scrollbar-track { background: transparent; }
+    .lb-comments-section::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+    
+    .lb-comment-item {
+      display: flex;
+      flex-direction: column;
+      background: rgba(255,255,255,.02);
+      border: 1px solid rgba(255,255,255,.03);
+      padding: 10px;
+      border-radius: 10px;
+      position: relative;
+    }
+    .lb-comment-item:hover .lb-comment-actions {
+      display: flex;
+    }
+    .lb-comment-meta {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 4px;
+    }
+    .lb-comment-author {
+      font-size: .78rem;
+      font-weight: 600;
+    }
+    .lb-comment-author.author-kien {
+      color: var(--rose);
+    }
+    .lb-comment-author.author-tho {
+      color: var(--blush);
+    }
+    .lb-comment-time {
+      font-size: .65rem;
+      color: var(--muted);
+    }
+    .lb-comment-text {
+      font-size: .83rem;
+      color: var(--text);
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .lb-comment-actions {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      display: none;
+      gap: 6px;
+      background: var(--card);
+      padding: 2px 6px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+    }
+    .lb-comment-action-btn {
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: color .2s;
+    }
+    .lb-comment-action-btn:hover {
+      color: var(--rose);
+    }
+    
+    /* Comment Input Section */
+    .lb-comment-input-area {
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+      background: rgba(0,0,0,.1);
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .lb-comment-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: inherit;
+      font-size: .83rem;
+      padding: 8px 12px;
+      border-radius: 20px;
+      box-sizing: border-box;
+    }
+    .lb-comment-input:focus {
+      outline: none;
+      border-color: var(--rose);
+    }
+    .lb-comment-send {
+      background: var(--rose);
+      border: none;
+      color: white;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      transition: background .2s, transform .2s;
+      flex-shrink: 0;
+    }
+    .lb-comment-send:hover {
+      background: #df4468;
+      transform: scale(1.05);
+    }
+    
+    @media (max-width: 768px) {
+      .lb-wrapper {
+        flex-direction: column;
+        height: 90vh;
+      }
+      .lb-info-pane {
+        width: 100%;
+        height: 300px;
+        flex: none;
+        border-left: none;
+        border-top: 1px solid var(--border);
+      }
+    }
     
     @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
@@ -570,20 +1044,56 @@ HTML_CONTENT = """<!DOCTYPE html>
 
   window.galleryItems = [];
   window.currentLbIndex = -1;
+  window.editingCaption = false;
+  window.editingCommentIdx = -1;
+
+  function escapeHtml(str) {
+    if (!str) return "";
+    return str.replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;")
+              .replace(/"/g, "&quot;")
+              .replace(/'/g, "&#039;");
+  }
 
   function openLightbox(index) {
     if (!window.galleryItems || index < 0 || index >= window.galleryItems.length) return;
     window.currentLbIndex = index;
+    window.editingCaption = false;
+    window.editingCommentIdx = -1;
+    
     var item = window.galleryItems[index];
     var src = item.url, type = item.type, name = item.name;
     
     var lb = document.getElementById('lightbox');
     var content = document.getElementById('lightboxContent');
+    
+    var html = '<div class="lb-wrapper">'
+             + '  <div class="lb-media-pane">';
+             
     if (type === 'video') {
-      content.innerHTML = '<video controls autoplay src="' + src + '" style="max-width:85vw; max-height:80vh; border-radius:14px; box-shadow: 0 28px 80px rgba(0,0,0,.85);"></video>';
+      html += '    <video controls autoplay src="' + src + '"></video>';
     } else {
-      content.innerHTML = '<img src="' + src + '" alt="Memory" style="max-width:85vw; max-height:80vh; border-radius:14px; box-shadow: 0 28px 80px rgba(0,0,0,.85);">';
+      html += '    <img src="' + src + '" alt="Memory">';
     }
+    
+    html += '  </div>'
+         + '  <div class="lb-info-pane">'
+         + '    <div class="lb-caption-section" id="lbCaptionSection"></div>'
+         + '    <div class="lb-comments-title" style="padding: 16px 16px 4px 16px;">Comments</div>'
+         + '    <div class="lb-comments-section" id="lbCommentsSection"></div>'
+         + '    <div class="lb-comment-input-area">'
+         + '      <input type="text" class="lb-comment-input" id="lbCommentInput" placeholder="Reply to Kiên... 💬" onkeydown="handleCommentKey(event)">'
+         + '      <button class="lb-comment-send" onclick="submitComment()">'
+         + '        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>'
+         + '      </button>'
+         + '    </div>'
+         + '  </div>'
+         + '</div>';
+         
+    content.innerHTML = html;
+    
+    var mediaPane = content.querySelector('.lb-media-pane');
     
     var delBtn = document.createElement('div');
     delBtn.className = 'lb-delete';
@@ -602,26 +1112,217 @@ HTML_CONTENT = """<!DOCTYPE html>
         });
       }
     };
-    content.appendChild(delBtn);
+    mediaPane.appendChild(delBtn);
 
-    // Add Left Nav Button if not first
     if (index > 0) {
         var leftBtn = document.createElement('div');
         leftBtn.className = 'lb-nav left';
         leftBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>';
         leftBtn.onclick = function(e) { e.stopPropagation(); navigateLightbox(-1); };
-        content.appendChild(leftBtn);
+        mediaPane.appendChild(leftBtn);
     }
-    // Add Right Nav Button if not last
     if (index < window.galleryItems.length - 1) {
         var rightBtn = document.createElement('div');
         rightBtn.className = 'lb-nav right';
         rightBtn.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>';
         rightBtn.onclick = function(e) { e.stopPropagation(); navigateLightbox(1); };
-        content.appendChild(rightBtn);
+        mediaPane.appendChild(rightBtn);
     }
+    
+    renderCaption();
+    renderComments();
 
     lb.classList.add('open');
+  }
+
+  function renderCaption() {
+    var item = window.galleryItems[window.currentLbIndex];
+    var container = document.getElementById('lbCaptionSection');
+    if (!container) return;
+    
+    var caption = item.caption || "";
+    
+    if (window.editingCaption) {
+      container.innerHTML = '<div class="lb-caption-title">&#x270d;&#xfe0f; Edit Caption</div>'
+                          + '<div class="lb-caption-edit-box">'
+                          + '  <textarea class="lb-caption-input" id="captionInput" placeholder="Write something sweet...">' + escapeHtml(caption) + '</textarea>'
+                          + '  <div class="lb-action-buttons">'
+                          + '    <button class="lb-btn" onclick="cancelCaptionEdit()">Cancel</button>'
+                          + '    <button class="lb-btn primary" onclick="saveCaption()">Save</button>'
+                          + '  </div>'
+                          + '</div>';
+      document.getElementById('captionInput').focus();
+    } else {
+      if (caption) {
+        container.innerHTML = '<div class="lb-caption-title" onclick="startCaptionEdit()" style="cursor:pointer;">&#x1f49d; Caption <span style="font-size:0.6rem;opacity:0.6;">(click to edit)</span></div>'
+                            + '<div class="lb-caption-text" onclick="startCaptionEdit()" style="cursor:pointer;">' + escapeHtml(caption) + '</div>';
+      } else {
+        container.innerHTML = '<div class="lb-caption-empty" onclick="startCaptionEdit()">'
+                            + '  <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>'
+                            + '  <span>Add a sweet caption...</span>'
+                            + '</div>';
+      }
+    }
+  }
+
+  function startCaptionEdit() {
+    window.editingCaption = true;
+    renderCaption();
+  }
+  
+  function cancelCaptionEdit() {
+    window.editingCaption = false;
+    renderCaption();
+  }
+  
+  function saveCaption() {
+    var val = document.getElementById('captionInput').value;
+    var item = window.galleryItems[window.currentLbIndex];
+    pywebview.api.save_caption(item.name, val).then(function(ok){
+      if (ok) {
+        item.caption = val;
+        window.editingCaption = false;
+        renderCaption();
+        showToast('&#x2764;&#xfe0f;', "Caption saved.");
+      } else {
+        showToast('&#x26a0;&#xfe0f;', "Failed to save caption.");
+      }
+    });
+  }
+
+  function formatTime(ts) {
+    if (!ts) return "";
+    var date = new Date(ts * 1000);
+    var hrs = date.getHours().toString().padStart(2, '0');
+    var mins = date.getMinutes().toString().padStart(2, '0');
+    var day = date.getDate().toString().padStart(2, '0');
+    var mth = (date.getMonth() + 1).toString().padStart(2, '0');
+    return hrs + ':' + mins + ' ' + day + '/' + mth;
+  }
+
+  function renderComments() {
+    var item = window.galleryItems[window.currentLbIndex];
+    var container = document.getElementById('lbCommentsSection');
+    if (!container) return;
+    
+    var comments = item.comments || [];
+    
+    if (comments.length === 0) {
+      container.innerHTML = '<div style="color:var(--muted);font-size:.78rem;text-align:center;padding:24px 0;font-style:italic;">No comments yet &#x1f338;</div>';
+      return;
+    }
+    
+    container.innerHTML = comments.map(function(c, idx) {
+      var authorClass = c.author === 'Kiên' ? 'author-kien' : 'author-tho';
+      var authorName = c.author === 'Kiên' ? 'Kiên 💕' : 'Thơ 🌸';
+      
+      if (window.editingCommentIdx === idx) {
+        return '<div class="lb-comment-item">'
+             + '  <div class="lb-caption-edit-box">'
+             + '    <input type="text" class="lb-caption-input" id="editCommentInput" value="' + escapeHtml(c.text) + '" style="min-height:auto;">'
+             + '    <div class="lb-action-buttons">'
+             + '      <button class="lb-btn" onclick="cancelCommentEdit()">Cancel</button>'
+             + '      <button class="lb-btn primary" onclick="saveCommentEdit(' + idx + ')">Save</button>'
+             + '    </div>'
+             + '  </div>'
+             + '</div>';
+      }
+      
+      var actions = '<div class="lb-comment-actions">'
+                  + '  <button class="lb-comment-action-btn" title="Edit" onclick="startCommentEdit(' + idx + ')">'
+                  + '    <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>'
+                  + '  </button>'
+                  + '  <button class="lb-comment-action-btn" title="Delete" onclick="deleteComment(' + idx + ')">'
+                  + '    <svg xmlns="http://www.w3.org/2000/svg" width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>'
+                  + '  </button>'
+                  + '</div>';
+              
+      return '<div class="lb-comment-item">'
+           + '  <div class="lb-comment-meta">'
+           + '    <span class="lb-comment-author ' + authorClass + '">' + authorName + '</span>'
+           + '    <span class="lb-comment-time">' + formatTime(c.ts) + '</span>'
+           + '  </div>'
+           + '  <div class="lb-comment-text">' + escapeHtml(c.text) + '</div>'
+           + actions
+           + '</div>';
+    }).join('');
+    
+    container.scrollTop = container.scrollHeight;
+  }
+
+  function handleCommentKey(e) {
+    if (e.key === 'Enter') {
+      submitComment();
+    }
+  }
+
+  function submitComment() {
+    var input = document.getElementById('lbCommentInput');
+    var text = input.value.trim();
+    if (!text) return;
+    
+    var item = window.galleryItems[window.currentLbIndex];
+    pywebview.api.add_comment(item.name, text, "Thơ").then(function(ok) {
+      if (ok) {
+        if (!item.comments) item.comments = [];
+        item.comments.push({
+          author: "Thơ",
+          text: text,
+          ts: Math.floor(Date.now() / 1000)
+        });
+        input.value = "";
+        renderComments();
+      } else {
+        showToast('&#x26a0;&#xfe0f;', "Couldn\\'t add comment.");
+      }
+    });
+  }
+
+  function startCommentEdit(idx) {
+    window.editingCommentIdx = idx;
+    renderComments();
+    setTimeout(function() {
+      var editInput = document.getElementById('editCommentInput');
+      if (editInput) {
+         editInput.focus();
+         editInput.select();
+      }
+    }, 50);
+  }
+
+  function cancelCommentEdit() {
+    window.editingCommentIdx = -1;
+    renderComments();
+  }
+
+  function saveCommentEdit(idx) {
+    var val = document.getElementById('editCommentInput').value.trim();
+    if (!val) return;
+    var item = window.galleryItems[window.currentLbIndex];
+    pywebview.api.edit_comment(item.name, idx, val).then(function(ok) {
+      if (ok) {
+        item.comments[idx].text = val;
+        window.editingCommentIdx = -1;
+        renderComments();
+        showToast('&#x2764;&#xfe0f;', "Comment updated.");
+      } else {
+        showToast('&#x26a0;&#xfe0f;', "Failed to update comment.");
+      }
+    });
+  }
+
+  function deleteComment(idx) {
+    if (!confirm("Delete this comment?")) return;
+    var item = window.galleryItems[window.currentLbIndex];
+    pywebview.api.delete_comment(item.name, idx).then(function(ok) {
+      if (ok) {
+        item.comments.splice(idx, 1);
+        renderComments();
+        showToast('&#x2728;', "Comment deleted.");
+      } else {
+        showToast('&#x26a0;&#xfe0f;', "Failed to delete comment.");
+      }
+    });
   }
 
   function navigateLightbox(offset) {
@@ -636,6 +1337,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     lb.classList.remove('open');
     document.getElementById('lightboxContent').innerHTML = '';
     window.currentLbIndex = -1;
+    window.editingCaption = false;
+    window.editingCommentIdx = -1;
   }
   document.addEventListener('keydown', function(e){ 
     if(e.key === 'Escape') closeLightbox(); 
