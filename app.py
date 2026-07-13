@@ -141,6 +141,7 @@ class Api:
                 reply_to = msg.get("reply_to_message", {})
                 reply_text = msg.get("text", "").strip()
                 if reply_to and reply_text:
+                    parent_msg_id = reply_to.get("message_id")
                     parent_fid = None
                     if "photo" in reply_to:
                         parent_fid = reply_to["photo"][-1]["file_id"]
@@ -149,12 +150,12 @@ class Api:
                     elif "document" in reply_to:
                         parent_fid = reply_to["document"]["file_id"]
                     
-                    if parent_fid:
+                    if parent_msg_id:
                         author_id = msg.get("from", {}).get("id")
                         author_name = msg.get("from", {}).get("first_name", "Kiên")
                         if str(author_id) == str(CHAT_ID):
                             author_name = "Kiên"
-                        update_metadata_actions.append(("comment", parent_fid, author_name, reply_text, date))
+                        update_metadata_actions.append(("comment_by_msg_id", parent_msg_id, author_name, reply_text, date, parent_fid))
 
             if download_tasks:
                 from concurrent.futures import ThreadPoolExecutor
@@ -196,9 +197,18 @@ class Api:
                         if meta[fname].get("message_id") != msg_id:
                             meta[fname]["message_id"] = msg_id
                             meta_changed = True
-                elif action[0] == "comment":
-                    _, parent_fid, author_name, comment_text, comment_date = action
-                    fname = _find_filename_by_file_id(parent_fid)
+                elif action[0] == "comment_by_msg_id":
+                    _, parent_msg_id, author_name, comment_text, comment_date, parent_fid = action
+                    fname = None
+                    # Search by parent message_id first
+                    for name, fmeta in meta.items():
+                        if fmeta.get("message_id") == parent_msg_id:
+                            fname = name
+                            break
+                    # Fallback to search by file_id if message_id wasn't mapped
+                    if not fname and parent_fid:
+                        fname = _find_filename_by_file_id(parent_fid)
+                        
                     if fname:
                         if fname not in meta:
                             meta[fname] = {}
@@ -1064,6 +1074,8 @@ HTML_CONTENT = """<!DOCTYPE html>
     
     var item = window.galleryItems[index];
     var src = item.url, type = item.type, name = item.name;
+    var isLocal = name.indexOf('local_') !== -1;
+    var placeholderText = isLocal ? "Write a comment... 💬" : "Reply to Kiên... 💬";
     
     var lb = document.getElementById('lightbox');
     var content = document.getElementById('lightboxContent');
@@ -1083,7 +1095,7 @@ HTML_CONTENT = """<!DOCTYPE html>
          + '    <div class="lb-comments-title" style="padding: 16px 16px 4px 16px;">Comments</div>'
          + '    <div class="lb-comments-section" id="lbCommentsSection"></div>'
          + '    <div class="lb-comment-input-area">'
-         + '      <input type="text" class="lb-comment-input" id="lbCommentInput" placeholder="Reply to Kiên... 💬" onkeydown="handleCommentKey(event)">'
+         + '      <input type="text" class="lb-comment-input" id="lbCommentInput" placeholder="' + placeholderText + '" onkeydown="handleCommentKey(event)">'
          + '      <button class="lb-comment-send" onclick="submitComment()">'
          + '        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>'
          + '      </button>'
@@ -1341,6 +1353,10 @@ HTML_CONTENT = """<!DOCTYPE html>
     window.editingCommentIdx = -1;
   }
   document.addEventListener('keydown', function(e){ 
+    var active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {
+      return;
+    }
     if(e.key === 'Escape') closeLightbox(); 
     else if(e.key === 'ArrowLeft') navigateLightbox(-1);
     else if(e.key === 'ArrowRight') navigateLightbox(1);
